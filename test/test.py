@@ -45,4 +45,4 @@ cor = "wiki_zh_2019\wiki_zh"
                 for item in reader:
                     corpus.writelines(item["text"])"""
 
-print(os.path.exists("test.py"))
+
