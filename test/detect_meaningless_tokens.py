@@ -1,13 +1,10 @@
 """
-Qwen3 tokenizer meaningless token detector
-Target: Detect meaningless tokens from the tokenizer's vocabulary,
-not from the corpus vocabulary.
-
-Byte-safe + corpus-aware + full-vocab analysis
-Author: GPT-5
+Fast Qwen tokenizer meaningless token detector
+Optimized for 100GB corpora with multiprocessing + streaming
+Author: Me, GPT-5 & Gemini-2.5 (fixed multiprocessing pickle issue)
 """
 
-import os, sys, re
+import os, sys, re, multiprocessing as mp
 from collections import Counter, defaultdict
 from math import log2
 import pandas as pd
@@ -15,122 +12,135 @@ from tqdm import tqdm
 import ahocorasick
 from transformers import AutoTokenizer
 
-# ---------- Helper ----------
+CHUNK_SIZE = 32 * 1024 * 1024  # 32MB per chunk
+
+# ---------- Helpers ----------
 
 def entropy(counts):
     total = sum(counts)
-    if total == 0:
+    if total == 0: 
         return 0.0
     probs = [c / total for c in counts]
     return -sum(p * log2(p) for p in probs if p > 0)
 
-def bytes_to_latin1_str(b: bytes) -> str:
+def bytes_to_latin1_str(b): 
     return b.decode('latin-1')
 
-def latin1_str_to_bytes(s: str) -> bytes:
+def latin1_str_to_bytes(s): 
     return s.encode('latin-1')
 
-# ---------- Processing ----------
+def neighbor_counter_factory():
+    """Top-level factory for defaultdict (multiprocessing-safe)."""
+    return {'left': Counter(), 'right': Counter()}
 
-def process_corpus_bytelevel(corpus_bytes: bytes, token_bytes_list):
-    """
-    Count occurrences and neighbor entropy for all tokenizer tokens.
-    Corpus is treated as byte stream; tokens are byte sequences.
-    """
-    print("Building Aho-Corasick automaton (byte-level via Latin-1)...")
+# ---------- Worker ----------
+
+def process_chunk(args):
+    """Process a chunk of the corpus and count token stats."""
+    chunk_bytes, token_bytes_list = args
+    corpus_str = bytes_to_latin1_str(chunk_bytes)
+
+    # Build automaton per process (fast for ~few MB)
     A = ahocorasick.Automaton()
-    for token_bytes in token_bytes_list:
-        token_str = bytes_to_latin1_str(token_bytes)
-        A.add_word(token_str, token_bytes)
+    for tb in token_bytes_list:
+        A.add_word(bytes_to_latin1_str(tb), tb)
     A.make_automaton()
-    print("Automaton built.")
 
     token_freq = Counter()
     standalone_freq = Counter()
-    neighbor_counters = defaultdict(lambda: {'left': Counter(), 'right': Counter()})
+    neighbor_counters = defaultdict(neighbor_counter_factory)
 
-    corpus_str = bytes_to_latin1_str(corpus_bytes)
     corpus_len = len(corpus_str)
+    for end_index, tb in A.iter(corpus_str):
+        token_freq[tb] += 1
+        start_index = end_index - len(bytes_to_latin1_str(tb)) + 1
 
-    print("Scanning corpus (byte-level, single pass)...")
-    for end_index, token_bytes in tqdm(A.iter(corpus_str), total=corpus_len, unit="char", unit_scale=True):
-        token_freq[token_bytes] += 1
-        start_index = end_index - len(bytes_to_latin1_str(token_bytes)) + 1
-
-        # Left / right neighbors
+        # Neighbors
         if start_index > 0:
             left_b = latin1_str_to_bytes(corpus_str[start_index - 1])[0]
-            neighbor_counters[token_bytes]['left'][left_b] += 1
+            neighbor_counters[tb]['left'][left_b] += 1
         if end_index + 1 < corpus_len:
             right_b = latin1_str_to_bytes(corpus_str[end_index + 1])[0]
-            neighbor_counters[token_bytes]['right'][right_b] += 1
+            neighbor_counters[tb]['right'][right_b] += 1
 
         # Standalone check
         if start_index > 0 and end_index + 1 < corpus_len:
-            left_visible = 32 <= latin1_str_to_bytes(corpus_str[start_index - 1])[0] <= 126
-            right_visible = 32 <= latin1_str_to_bytes(corpus_str[end_index + 1])[0] <= 126
-            if not left_visible and not right_visible:
-                standalone_freq[token_bytes] += 1
+            lvis = 32 <= latin1_str_to_bytes(corpus_str[start_index - 1])[0] <= 126
+            rvis = 32 <= latin1_str_to_bytes(corpus_str[end_index + 1])[0] <= 126
+            if not lvis and not rvis:
+                standalone_freq[tb] += 1
 
     return token_freq, standalone_freq, neighbor_counters
 
 
 # ---------- Main ----------
 
-def main(corpus_path, output_path):
+def main(corpus_path, output_path, n_workers=mp.cpu_count()):
 
-    print("Loading Qwen3 tokenizer...")
+    print(f"Loading Qwen tokenizer...")
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B", trust_remote_code=True)
     vocab = tok.get_vocab()
     tokens = list(vocab.keys())
-    print(f"Loaded {len(tokens)} tokens from tokenizer vocabulary.")
+    print(f"Loaded {len(tokens)} tokens.")
 
-    # Convert tokens → bytes
+    # Convert tokens → bytes once
     token_bytes_list = []
     token_bytes_map = {}
     for t in tokens:
         try:
-            token_bytes = tok.convert_tokens_to_string([t]).encode('utf-8', errors='replace')
+            tb = tok.convert_tokens_to_string([t]).encode('utf-8', errors='replace')
         except Exception:
-            token_bytes = t.encode('utf-8', errors='replace')
-        token_bytes_list.append(token_bytes)
-        token_bytes_map[token_bytes] = t
+            tb = t.encode('utf-8', errors='replace')
+        token_bytes_list.append(tb)
+        token_bytes_map[tb] = t
 
-    # Read corpus bytes
-    print("Reading corpus as bytes...")
+    print(f"Starting parallel corpus scan with {n_workers} workers...")
+    pool = mp.Pool(processes=n_workers)
+    tasks = []
+
+    # Chunked reading
     with open(corpus_path, "rb") as f:
-        corpus_bytes = f.read()
+        while True:
+            chunk = f.read(CHUNK_SIZE)
+            if not chunk:
+                break
+            tasks.append((chunk, token_bytes_list))
 
-    token_freq, standalone_freq, neighbor_counters = process_corpus_bytelevel(
-        corpus_bytes, token_bytes_list
-    )
+    results = list(tqdm(pool.imap_unordered(process_chunk, tasks), total=len(tasks)))
+    pool.close()
+    pool.join()
 
-    # ---------- Aggregate results ----------
-    print("Computing neighbor entropy and aggregating results...")
+    # Merge results
+    print("Aggregating results...")
+    token_freq = Counter()
+    standalone_freq = Counter()
+    neighbor_counters = defaultdict(neighbor_counter_factory)
+
+    for tf, sf, nc in results:
+        token_freq.update(tf)
+        standalone_freq.update(sf)
+        for k, v in nc.items():
+            neighbor_counters[k]['left'].update(v['left'])
+            neighbor_counters[k]['right'].update(v['right'])
+
+    # Compute metrics
+    print("Computing final metrics...")
+    byte_pattern = re.compile(rb"[\x00-\x08\x0B\x0C\x0E-\x1F]")
     data = []
-    byte_pattern = re.compile(rb"[\x00-\x08\x0B\x0C\x0E-\x1F]")  # control bytes
-
     for tb in tqdm(token_bytes_list):
         freq = token_freq.get(tb, 0)
         ratio = standalone_freq.get(tb, 0) / (freq + 1e-6)
-        ent = 0.0
         if tb in neighbor_counters:
-            left_counts = neighbor_counters[tb]['left'].values()
-            right_counts = neighbor_counters[tb]['right'].values()
-            ent = entropy(list(left_counts) + list(right_counts))
-
+            ent = entropy(list(neighbor_counters[tb]['left'].values()) +
+                          list(neighbor_counters[tb]['right'].values()))
+        else:
+            ent = 0.0
         tok_str = tb.decode('utf-8', errors='replace')
-
-        # Heuristics for meaningless tokens:
-        #  - never appears (freq == 0)
-        #  - mostly control bytes
-        #  - low entropy and no standalone usage
         meaningless = (
             (freq == 0)
             or byte_pattern.search(tb)
             or (ent < 0.5 and ratio < 0.05 and freq < 10)
         )
-
         data.append({
             "token": tok_str,
             "freq_in_corpus": freq,
@@ -144,14 +154,13 @@ def main(corpus_path, output_path):
     df.sort_values("freq_in_corpus", ascending=False, inplace=True)
     df.to_csv(output_path, index=False, encoding="utf-8-sig")
 
-    print(f"Done. Results saved to {output_path}")
-    print(f"Meaningless tokens found: {df['meaningless'].sum()} / {len(df)}")
+    print(f"✅ Done. Saved to {output_path}")
+    print(f"Meaningless tokens: {df['meaningless'].sum()} / {len(df)}")
 
-
-# ---------- Run ----------
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print("Usage: python detect_meaningless_tokens.py corpus.txt output.csv")
+    if len(sys.argv) < 3:
+        print("Usage: python detect_meaningless_tokens_fast.py corpus.txt output.csv [n_workers]")
         sys.exit(1)
-    main(sys.argv[1], sys.argv[2])
+    n_workers = int(sys.argv[3]) if len(sys.argv) > 3 else mp.cpu_count()
+    main(sys.argv[1], sys.argv[2], n_workers)
