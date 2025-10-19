@@ -3,14 +3,18 @@ Fast Qwen tokenizer meaningless token detector
 Optimized for 100GB corpora with multiprocessing + streaming
 Author: Me, GPT-5 & Gemini-2.5 (fixed multiprocessing pickle issue)
 """
+import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
-import os, sys, re, multiprocessing as mp
+import sys, re, multiprocessing as mp
+import argparse
 from collections import Counter, defaultdict
 from math import log2
 import pandas as pd
 from tqdm import tqdm
 import ahocorasick
 from transformers import AutoTokenizer
+from datasets import load_dataset, ReadInstruction
 
 CHUNK_SIZE = 32 * 1024 * 1024  # 32MB per chunk
 
@@ -63,7 +67,7 @@ def process_chunk(args):
             right_b = latin1_str_to_bytes(corpus_str[end_index + 1])[0]
             neighbor_counters[tb]['right'][right_b] += 1
 
-        # Standalone check
+        # Standalone check (only for english-style languages)
         if start_index > 0 and end_index + 1 < corpus_len:
             lvis = 32 <= latin1_str_to_bytes(corpus_str[start_index - 1])[0] <= 126
             rvis = 32 <= latin1_str_to_bytes(corpus_str[end_index + 1])[0] <= 126
@@ -75,13 +79,13 @@ def process_chunk(args):
 
 # ---------- Main ----------
 
-def main(corpus_path, output_path, n_workers=mp.cpu_count()):
+def main(dataset_mode, corpus_path, output_path, n_workers=mp.cpu_count()):
 
-    print(f"Loading Qwen tokenizer...")
+    print(f"Loading Qwen tokenizer...", flush=True)
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B", trust_remote_code=True)
     vocab = tok.get_vocab()
     tokens = list(vocab.keys())
-    print(f"Loaded {len(tokens)} tokens.")
+    print(f"Loaded {len(tokens)} tokens.", flush=True)
 
     # Convert tokens → bytes once
     token_bytes_list = []
@@ -94,24 +98,42 @@ def main(corpus_path, output_path, n_workers=mp.cpu_count()):
         token_bytes_list.append(tb)
         token_bytes_map[tb] = t
 
-    print(f"Starting parallel corpus scan with {n_workers} workers...")
+    print(f"Starting parallel corpus scan with {n_workers} workers...", flush=True)
     pool = mp.Pool(processes=n_workers)
     tasks = []
 
     # Chunked reading
-    with open(corpus_path, "rb") as f:
-        while True:
-            chunk = f.read(CHUNK_SIZE)
-            if not chunk:
-                break
-            tasks.append((chunk, token_bytes_list))
+    if dataset_mode:
+        # Hf dataset
+        #"Geralt-Targaryen/C4-zh"
+        dataset = load_dataset(corpus_path, split="train", streaming=True)
+
+        buffer = bytearray()
+        print("Loading Huggingface Dataset: "+corpus_path, flush=True)
+        for sample in dataset:
+            text = sample["text"].encode("utf-8")
+            buffer.extend(text)
+            if len(buffer) >= CHUNK_SIZE:
+                tasks.append((bytes(buffer), token_bytes_list))
+                buffer.clear()
+
+        # process last partial chunk
+        if buffer:
+            tasks.append((bytes(buffer), token_bytes_list))
+    else:
+        with open(corpus_path, "rb") as f:
+            while True:
+                chunk = f.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                tasks.append((chunk, token_bytes_list))
 
     results = list(tqdm(pool.imap_unordered(process_chunk, tasks), total=len(tasks)))
     pool.close()
     pool.join()
 
     # Merge results
-    print("Aggregating results...")
+    print("Aggregating results...", flush=True)
     token_freq = Counter()
     standalone_freq = Counter()
     neighbor_counters = defaultdict(neighbor_counter_factory)
@@ -124,7 +146,7 @@ def main(corpus_path, output_path, n_workers=mp.cpu_count()):
             neighbor_counters[k]['right'].update(v['right'])
 
     # Compute metrics
-    print("Computing final metrics...")
+    print("Computing final metrics...", flush=True)
     byte_pattern = re.compile(rb"[\x00-\x08\x0B\x0C\x0E-\x1F]")
     data = []
     for tb in tqdm(token_bytes_list):
@@ -154,13 +176,20 @@ def main(corpus_path, output_path, n_workers=mp.cpu_count()):
     df.sort_values("freq_in_corpus", ascending=False, inplace=True)
     df.to_csv(output_path, index=False, encoding="utf-8-sig")
 
-    print(f"✅ Done. Saved to {output_path}")
-    print(f"Meaningless tokens: {df['meaningless'].sum()} / {len(df)}")
+    print(f"✅ Done. Saved to {output_path}", flush=True)
+    print(f"Meaningless tokens: {df['meaningless'].sum()} / {len(df)}", flush=True)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print("Usage: python detect_meaningless_tokens_fast.py corpus.txt output.csv [n_workers]")
-        sys.exit(1)
-    n_workers = int(sys.argv[3]) if len(sys.argv) > 3 else mp.cpu_count()
-    main(sys.argv[1], sys.argv[2], n_workers)
+    parser = argparse.ArgumentParser(description="This is a program aiming to find meaningless tokens in Qwen-2.5 tokenizer.")
+
+    parser.add_argument("-d", "--dataset", action="store_true", help="Use hf dataset instead of local files.")  #action="store_true"
+    parser.add_argument("-p", "--path", type=str, default="corpus.txt", help="Path to the dataset. If using hf dataset, this should be the dataset name.")
+    parser.add_argument("-o", "--output", type=str, default="output.csv", help="Output path of the result.")
+    parser.add_argument("-n", "--num_cpus", type=int, default=0, help="Numbers of cpus that's utilized. If this arg is not passed, the program will use all CPUs in the system.")
+
+    # 解析参数
+    args = parser.parse_args()
+
+    n_workers = args.num_cpus if args.num_cpus != 0 else mp.cpu_count()
+    main(args.dataset, args.path, args.output, n_workers)
