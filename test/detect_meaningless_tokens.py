@@ -43,7 +43,7 @@ def neighbor_counter_factory():
 def batch_iter(iterable, batch_size):
     it = iter(iterable)
     while True:
-        batch = list(islice(it, batch_size))
+        batch = list(islice(it, int(batch_size)))
         if not batch:
             break
         yield batch
