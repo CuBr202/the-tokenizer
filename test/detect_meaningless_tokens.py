@@ -110,7 +110,7 @@ def main(dataset_mode, corpus_path, output_path, n_workers=mp.cpu_count()):
 
         buffer = bytearray()
         print("Loading Huggingface Dataset: "+corpus_path, flush=True)
-        for sample in dataset:
+        for sample in tqdm(dataset):
             text = sample["text"].encode("utf-8")
             buffer.extend(text)
             if len(buffer) >= CHUNK_SIZE:
