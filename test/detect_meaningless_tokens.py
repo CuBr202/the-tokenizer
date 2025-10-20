@@ -17,7 +17,7 @@ from transformers import AutoTokenizer
 from datasets import load_dataset, ReadInstruction
 from itertools import islice
 
-CHUNK_SIZE = 32 * 1024 * 1024  # 32MB per chunk
+
 
 # ---------- Helpers ----------
 
@@ -93,7 +93,8 @@ def process_chunk(args):
 
 # ---------- Main ----------
 
-def main(dataset_mode, corpus_path, output_path, n_workers=mp.cpu_count()):
+def main(dataset_mode, corpus_path, output_path, n_workers=mp.cpu_count(), CHUNK_SIZE = 32 * 1024 * 1024):
+    BATCH_SIZE = CHUNK_SIZE/ (8*1024)
 
     print(f"Loading Qwen tokenizer...", flush=True)
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B", trust_remote_code=True)
@@ -123,8 +124,7 @@ def main(dataset_mode, corpus_path, output_path, n_workers=mp.cpu_count()):
         print(f"Loading Huggingface Dataset: {corpus_path}", flush=True)
         dataset = load_dataset(corpus_path, split="train", streaming=True)
 
-        # smaller batches keep memory low and parallelism high
-        BATCH_SIZE = 5000  
+        # smaller batches keep memory low and parallelism high 
         buffer = bytearray()
         tasks = []
 
@@ -208,9 +208,10 @@ if __name__ == "__main__":
     parser.add_argument("-p", "--path", type=str, default="corpus.txt", help="Path to the dataset. If using hf dataset, this should be the dataset name.")
     parser.add_argument("-o", "--output", type=str, default="output.csv", help="Output path of the result.")
     parser.add_argument("-n", "--num_cpus", type=int, default=0, help="Numbers of cpus that's utilized. If this arg is not passed, the program will use all CPUs in the system.")
+    parser.add_argument("-c", "--chunk_size", type=int, default=32*1024*1024, help="Chunks of memory allocations in the process.")
 
     # 解析参数
     args = parser.parse_args()
 
     n_workers = args.num_cpus if args.num_cpus != 0 else mp.cpu_count()
-    main(args.dataset, args.path, args.output, n_workers)
+    main(args.dataset, args.path, args.output, n_workers, args.chunk_size)
