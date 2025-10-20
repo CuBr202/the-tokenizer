@@ -15,6 +15,7 @@ from tqdm import tqdm
 import ahocorasick
 from transformers import AutoTokenizer
 from datasets import load_dataset, ReadInstruction
+from itertools import islice
 
 CHUNK_SIZE = 32 * 1024 * 1024  # 32MB per chunk
 
@@ -38,6 +39,19 @@ def neighbor_counter_factory():
     return {'left': Counter(), 'right': Counter()}
 
 # ---------- Worker ----------
+
+def batch_iter(iterable, batch_size):
+    it = iter(iterable)
+    while True:
+        batch = list(islice(it, batch_size))
+        if not batch:
+            break
+        yield batch
+
+def assemble_batch(batch):
+    """Encode a batch of samples into bytes (fast in parallel)."""
+    joined_text = "\n".join(s["text"] for s in batch)
+    return joined_text.encode("utf-8", errors="ignore")
 
 def process_chunk(args):
     """Process a chunk of the corpus and count token stats."""
@@ -106,20 +120,27 @@ def main(dataset_mode, corpus_path, output_path, n_workers=mp.cpu_count()):
     if dataset_mode:
         # Hf dataset
         #"Geralt-Targaryen/C4-zh"
+        print(f"Loading Huggingface Dataset: {corpus_path}", flush=True)
         dataset = load_dataset(corpus_path, split="train", streaming=True)
 
+        # smaller batches keep memory low and parallelism high
+        BATCH_SIZE = 5000  
         buffer = bytearray()
-        print("Loading Huggingface Dataset: "+corpus_path, flush=True)
-        for sample in tqdm(dataset):
-            text = sample["text"].encode("utf-8")
-            buffer.extend(text)
-            if len(buffer) >= CHUNK_SIZE:
-                tasks.append((bytes(buffer), token_bytes_list))
-                buffer.clear()
+        tasks = []
 
-        # process last partial chunk
-        if buffer:
-            tasks.append((bytes(buffer), token_bytes_list))
+        # parallel encode batches -> bytes
+        with mp.Pool(processes=n_workers) as encode_pool:  # Unlimited!
+            for encoded_batch in tqdm(
+                encode_pool.imap_unordered(assemble_batch, batch_iter(dataset, BATCH_SIZE)),
+                desc="Encoding dataset batches"
+            ):
+                buffer.extend(encoded_batch)
+                if len(buffer) >= CHUNK_SIZE:
+                    tasks.append((bytes(buffer), token_bytes_list))
+                    buffer.clear()
+
+            if buffer:
+                tasks.append((bytes(buffer), token_bytes_list))
     else:
         with open(corpus_path, "rb") as f:
             while True:
