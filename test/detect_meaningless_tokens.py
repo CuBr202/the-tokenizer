@@ -198,7 +198,7 @@ def main(dataset_mode, corpus_path, output_path, n_workers=mp.cpu_count(), CHUNK
     df.to_csv(output_path, index=False, encoding="utf-8-sig")
 
     print(f"✅ Done. Saved to {output_path}", flush=True)
-    print(f"Meaningless tokens: {df['meaningless'].sum()} / {len(df)}", flush=True)
+    #print(f"Meaningless tokens: {df['meaningless'].sum()} / {len(df)}", flush=True)
 
 
 if __name__ == "__main__":
