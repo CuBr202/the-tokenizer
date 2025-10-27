@@ -34,6 +34,7 @@ from typing import Iterator, Dict, Any
 
 from transformers import AutoTokenizer
 from datasets import Dataset, load_dataset, ReadInstruction
+from .utils import get_total_lines
 
 # --- Worker Function ---
 # This is the core logic that runs on each parallel process.
@@ -41,6 +42,7 @@ class Worker:
     def __init__(self, tokenizer_name: str):
         self.tokenizer_name = tokenizer_name
         self.tokenizer = None
+        self.tokenize_times = 0
         
     def _init_tokenizer(self):
         print(f"Initializing tokenizer in worker {mp.current_process().pid}...")
@@ -54,7 +56,17 @@ class Worker:
             self._init_tokenizer()
 
         assert self.tokenizer is not None, "Tokenizer should be initialized."
+        print(f"start to tokenize at time: {self.tokenize_times} in process {mp.current_process().pid}")
+        print(f"seq length: {len(text_chunk)}")
         tokens = self.tokenizer(text_chunk)['input_ids']
+        if isinstance(tokens[0], list):
+            # Flatten list of lists
+            flat_tokens = []
+            for sublist in tokens:
+                flat_tokens.extend(sublist)
+            tokens = flat_tokens
+        print(f"Finished tokenizing at time: {self.tokenize_times} in process {mp.current_process().pid}.")
+        self.tokenize_times += 1
 
         return Counter(tokens)
 
@@ -62,19 +74,31 @@ class Worker:
 # --- Helper Generators ---
 # These functions stream chunks of text to the multiprocessing pool.
 
-def read_chunks_from_jsonl(file_path: str, chunk_size: int) -> Iterator[str]:
+def read_chunks_from_jsonl(file_path: str, chunk_size: int) -> Iterator[list[str]]:
     count = 0
-    return_str = ""
+    finished = 0
+    print(f"Total length: {get_total_lines(file_path)}.")
+    return_str = []
     with open(file_path, "r", encoding="utf-8") as f:
-        for line in f:
+        while True:
+            line = f.readline()
+            if not line:
+                break
             line = line.strip()
             count += 1
-            return_str += json.loads(line)['conversations'][0]['content']
+            finished += 1
+            try:
+                return_str.append(json.loads(line)['conversations'][0]['content'])
+            except Exception as e:
+                print(f"Error try to load json: {e}")
             if count == chunk_size:
                 count = 0
+                print(f'Have finished: {finished}')
                 yield return_str
+                return_str = []
         if count != 0:
             yield return_str
+            return_str = []
         return 
 
 def read_chunks_from_file(file_path: str, chunk_size_bytes: int) -> Iterator[str]:
