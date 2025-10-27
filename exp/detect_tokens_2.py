@@ -37,22 +37,45 @@ from datasets import Dataset, load_dataset, ReadInstruction
 
 # --- Worker Function ---
 # This is the core logic that runs on each parallel process.
-
-def tokenize_and_count(text_chunk: str) -> Counter:
-    """
-    Tokenizes a chunk of text and returns its token frequencies.
-    """
-
-    if not hasattr(tokenize_and_count, "tokenizer"):
+class Worker:
+    def __init__(self, tokenizer_name: str):
+        self.tokenizer_name = tokenizer_name
+        self.tokenizer = None
+        
+    def _init_tokenizer(self):
         print(f"Initializing tokenizer in worker {mp.current_process().pid}...")
-        tokenize_and_count.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B", trust_remote_code=True)
-    tokens = tokenize_and_count.tokenizer(text_chunk)['input_ids']
+        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name, trust_remote_code=True, use_fast=True)
+        
+    def tokenize_and_count(self, text_chunk: str) -> Counter:
+        """
+        Tokenizes a chunk of text and returns its token frequencies.
+        """
+        if self.tokenizer is None:
+            self._init_tokenizer()
 
-    return Counter(tokens)
+        assert self.tokenizer is not None, "Tokenizer should be initialized."
+        tokens = self.tokenizer(text_chunk)['input_ids']
+
+        return Counter(tokens)
 
 
 # --- Helper Generators ---
 # These functions stream chunks of text to the multiprocessing pool.
+
+def read_chunks_from_jsonl(file_path: str, chunk_size: int) -> Iterator[str]:
+    count = 0
+    return_str = ""
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            count += 1
+            return_str += json.loads(line)['conversations'][0]['content']
+            if count == chunk_size:
+                count = 0
+                yield return_str
+        if count != 0:
+            yield return_str
+        return 
 
 def read_chunks_from_file(file_path: str, chunk_size_bytes: int) -> Iterator[str]:
     """
@@ -161,6 +184,10 @@ def main(args: argparse.Namespace):
         except Exception as e:
             print(f"Error loading dataset '{args.corpus_path}': {e}", file=sys.stderr)
             sys.exit(1)
+    elif args.jsonl:
+        text_chunks_iterator = read_chunks_from_jsonl(
+            args.corpus_path, CHUNK_SIZE_BYTES
+        )
 
     else:
         print(f"Reading local file: {args.corpus_path}", flush=True)
@@ -168,6 +195,9 @@ def main(args: argparse.Namespace):
         text_chunks_iterator = read_chunks_from_file(
             args.corpus_path, CHUNK_SIZE_BYTES
         )
+        
+    worker = Worker(tokenizer_name=args.tokenizer)
+    tokenize_and_count = worker.tokenize_and_count
 
     # --- Multiprocessing Pool ---
     # We use pool.imap_unordered() for efficiency.
@@ -227,6 +257,12 @@ if __name__ == "__main__":
     )
     
     parser.add_argument(
+        "tokenizer",
+        type=str,
+        help="The name or path of the tokenizer."
+    )
+    
+    parser.add_argument(
         "-p","--corpus_path",
         type=str,
         default="../test/corpus.txt",
@@ -237,6 +273,12 @@ if __name__ == "__main__":
         "-d","--dataset_mode",
         action="store_true",
         help="Enable this flag if 'corpus_path' is a Hugging Face dataset name."
+    )
+    
+    parser.add_argument(
+        "-j", "--jsonl",
+        action="store_true",
+        help="read jsonl file."
     )
     
     parser.add_argument(
