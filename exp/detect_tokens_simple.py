@@ -11,7 +11,8 @@ and aggregates the results into a single JSON file.
 Example Usage:
 
 # 1. From a local file (e.g., a 1GB text file)
-python detect_tokens_simple.py -p ../test/corpus.txt -c 64 Qwen/Qwen2.5-7B
+python detect_tokens_simple.py -p ../test/corpus.txt -c 512 Qwen/Qwen2.5-7B
+python detect_tokens_simple.py -p ../test/corpus.txt -c 512 gpt5
 
 # 2. From a Hugging Face streaming dataset
 python3 detect_tokens_2.py "Geralt-Targaryen/C4-zh" \
@@ -24,12 +25,13 @@ python3 detect_tokens_2.py "Geralt-Targaryen/C4-zh" \
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
-
+import execjs
 import argparse
 import json
 import sys
 from collections import Counter
 from typing import Iterator, Dict, Any
+import tiktoken
 
 from transformers import AutoTokenizer
 from datasets import Dataset, load_dataset, ReadInstruction
@@ -48,7 +50,21 @@ class Worker:
         self.tokenize_times = 0
         
     def _init_tokenizer(self):
-        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name, trust_remote_code=True, use_fast=True)
+        if "gpt" in self.tokenizer_name:
+            """Loads JavaScript module for gpt-style tokenizer"""
+            try:
+                js_code = open("gpt_tokenizer.mjs", "r", encoding="utf-8").read()
+                self.tokenizer = execjs.compile(js_code)
+            except Exception as e:
+                print(f"Frror occurred when loading JavaScript GPT-tokenizer module:{e}", file=sys.stderr)
+                print("Falling back to tiktoken (gpt-4o).", file=sys.stderr)
+                try:
+                    encoding = tiktoken.encoding_for_model("gpt-4o")
+                except KeyError:
+                    print("Warning: model not found. Using cl100k_base encoding.")
+                    encoding = tiktoken.get_encoding("cl100k_base")
+        else:
+            self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name, trust_remote_code=True, use_fast=True)
         
     def tokenize_and_count(self, text_chunk: str) -> Counter:
         """
@@ -58,7 +74,17 @@ class Worker:
             self._init_tokenizer()
 
         assert self.tokenizer is not None, "Tokenizer should be initialized."
-        tokens = self.tokenizer(text_chunk)['input_ids']
+
+        if "gpt" in self.tokenizer_name:
+            if not isinstance(self.tokenizer, tiktoken.Encoding):
+                """Run JavaScript module for gpt-style tokenizer"""
+                tokens = self.tokenizer.call("tokenize", text_chunk)
+            else:
+                """load tiktoken gpt-style tokenizer(gpt-4o)"""
+                tokens = self.tokenizer.encode(text_chunk)
+        else:
+            tokens = self.tokenizer(text_chunk)['input_ids']
+
         if isinstance(tokens[0], list):
             # Flatten list of lists
             flat_tokens = []
@@ -219,14 +245,14 @@ def main(args: argparse.Namespace):
     tokenize_and_count = worker.tokenize_and_count
 
     try:
-        print("Process started. Processing chunks and aggregating results...")
+        print("Process started. Processing chunks and aggregating results...", flush=True)
         chunk_count = 0
         for i, counts_from_chunk in enumerate(text_chunks_iterator):
             total_counts.update(tokenize_and_count(counts_from_chunk))
             chunk_count = i + 1
             
-            # Print a progress update every 1000 chunks
-            if chunk_count % 1000 == 0:
+            # Print a progress update every 100 chunks
+            if chunk_count % 100 == 0:
                 print(
                     f"  ... Aggregated {chunk_count} chunks. "
                     f"Total unique tokens so far: {len(total_counts)}",
