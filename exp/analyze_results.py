@@ -113,7 +113,7 @@ def main(full_name: str):
 def parse_args():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("name_or_path", type=str, help="The name or path of the tokenizer".)
+    parser.add_argument("name_or_path", type=str, help="The name or path of the tokenizer.")
     return parser.parse_args()
 
 if __name__ == "__main__":
