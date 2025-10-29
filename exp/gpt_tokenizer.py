@@ -1,6 +1,7 @@
 import execjs
 import multiprocessing
 import os
+import sys
 from typing import List
 
 # --- Worker Functions ---
@@ -61,6 +62,9 @@ class JSGPTTokenizer:
     **Note:** When using use_mp=True, it is highly recommended to use
     this class as a context manager (with the 'with' statement) to ensure
     the multiprocessing pool is properly closed.
+
+    TODO: The multiprocessing are not able to shutdown when pressing Ctrl+C.
+    This should be fixed.
 
     Example:
         with JSGPTTokenizer(use_mp=True) as tokenizer:
@@ -126,30 +130,50 @@ class JSGPTTokenizer:
 
     def close(self):
         """
-        Safely closes the multiprocessing pool.
-        Call this when you are done, or use the 'with' statement.
+        Safely closes the multiprocessing pool (graceful shutdown).
+        Waits for all tasks to finish.
         """
         if self.pool:
-            print("Closing multiprocessing pool...")
-            self.pool.close() # Prevents any more tasks from being submitted
-            self.pool.join()  # Waits for all worker processes to finish and exit
+            print("Closing multiprocessing pool gracefully...")
+            self.pool.close() # Prevents any more tasks
+            self.pool.join()  # Waits for all worker processes to finish
             self.pool = None
             print("Pool closed.")
 
-    # --- Context Manager Support ('with' statement) ---
-    
+    def terminate(self):
+        """
+        Forcibly terminates the multiprocessing pool (hard shutdown).
+        Used for KeyboardInterrupt.
+        """
+        if self.pool:
+            print("Terminating multiprocessing pool immediately...", file=sys.stderr)
+            self.pool.terminate() # Sends SIGTERM to all workers
+            self.pool.join()      # Waits for processes to die
+            self.pool = None
+            print("Pool terminated.")
+
     def __enter__(self):
-        """Allows the class to be used in a 'with' statement."""
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Called when exiting the 'with' block, ensures pool is closed."""
-        self.close()
+        """
+        Called when exiting the 'with' block.
+        This is now interrupt-aware.
+        """
+        if exc_type == KeyboardInterrupt:
+            # If the block was exited by Ctrl+C,
+            # we MUST terminate, not close/join, to avoid hanging.
+            self.terminate()
+        else:
+            # Normal exit or a different exception, try graceful shutdown.
+            self.close()
 
     def __del__(self):
         """
-        Fallback destructor to ensure the pool is closed if the user
-        forgets to call .close() or use a 'with' statement.
+        Fallback destructor. Use terminate() as it's safer
+        during garbage collection than close().
         """
-        self.close()
+        if self.pool:
+            print("Warning: JSGPTTokenizer was not closed. Terminating pool from __del__.", file=sys.stderr)
+            self.terminate()
 

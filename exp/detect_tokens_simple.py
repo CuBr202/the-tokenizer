@@ -96,22 +96,37 @@ class Worker:
         return Counter(tokens)
     
     def close(self):
-        """
-        Explicitly closes any held resources, like the JSGPTTokenizer pool.
-        """
+        """Gracefully close held resources."""
         if isinstance(self.tokenizer, JSGPTTokenizer):
             self.tokenizer.close()
+        # Add cleanup for AutoTokenizer if needed
     
-    def __del__(self):
-        # You can keep __del__ as a fallback, but don't rely on it.
-        self.close()
+    def terminate(self):
+        """Forcibly terminate held resources."""
+        if isinstance(self.tokenizer, JSGPTTokenizer):
+            self.tokenizer.terminate()
+        # Add cleanup for AutoTokenizer if needed
 
-    # Optional: Make it a context manager for even safer use
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
+        """
+        Called when exiting the 'with' block.
+        Passes the exception type to decide how to shut down.
+        """
+        if exc_type == KeyboardInterrupt:
+            print("Worker caught interrupt, terminating...", file=sys.stderr)
+            self.terminate() # Hard shutdown
+        else:
+            self.close() # Graceful shutdown
+    
+    def __del__(self):
+        """
+        Fallback destructor. Use terminate() as it's safer.
+        """
+        # Note: __del__ is unreliable, but this is better than nothing.
+        self.terminate()
 
 
 # --- Helper Generators ---
@@ -157,8 +172,6 @@ def read_chunks_from_file(file_path: str, chunk_size_bytes: int) -> Iterator[lis
     SINGLE_CHUNK = 64*1024 # each str is 64kb
     try:
         iterations = int(chunk_size_bytes/SINGLE_CHUNK)
-        print("Chunk size bytes:",chunk_size_bytes)
-        print("Iterations:",iterations)
         with open(file_path, "r", encoding="utf-8") as f:
             batch = []
             chunk = ''
@@ -166,7 +179,6 @@ def read_chunks_from_file(file_path: str, chunk_size_bytes: int) -> Iterator[lis
                 for _ in range(iterations):
                     chunk = f.read(SINGLE_CHUNK)
                     batch.append(chunk)
-                print(len(batch))
                 yield batch
                 batch = []
 
@@ -299,16 +311,13 @@ def main(args: argparse.Namespace):
                         f"Total unique tokens so far: {len(total_counts)}",
                         flush=True
                     )
-
             print(f"\nProcessing complete. Aggregated a total of {chunk_count} chunks.")
 
         except KeyboardInterrupt:
             print("\nInterrupted by user. Stopping...", file=sys.stderr)
             print("Note: Results will be partial.", file=sys.stderr)
-            Worker.close()
         except Exception as e:
             print(f"\nAn error occurred: {e}", file=sys.stderr)
-            Worker.close()
     
     # --- Save Results ---
     if not total_counts:
