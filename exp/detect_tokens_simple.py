@@ -11,8 +11,8 @@ and aggregates the results into a single JSON file.
 Example Usage:
 
 # 1. From a local file (e.g., a 1GB text file)
-python detect_tokens_simple.py -p ../test/corpus.txt -c 2048 Qwen/Qwen2.5-7B
-python detect_tokens_simple.py -p ../test/corpus.txt -c 1024 gpt5
+python detect_tokens_simple.py -p ../test/corpus.txt -c 4096 Qwen/Qwen2.5-7B
+python detect_tokens_simple.py -p ../test/corpus.txt -c 4096 gpt5
 
 # 2. From a Hugging Face streaming dataset
 python3 detect_tokens_2.py "Geralt-Targaryen/C4-zh" \
@@ -25,7 +25,6 @@ python3 detect_tokens_2.py "Geralt-Targaryen/C4-zh" \
 import os
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
-import execjs
 import argparse
 import json
 import sys
@@ -37,6 +36,7 @@ import time
 from transformers import AutoTokenizer
 from datasets import Dataset, load_dataset, ReadInstruction
 
+from gpt_tokenizer import JSGPTTokenizer
 try:
     from .utils import get_total_lines
 except:
@@ -53,8 +53,7 @@ class Worker:
         if "gpt" in self.tokenizer_name:
             """Loads JavaScript module for gpt-style tokenizer"""
             try:
-                js_code = open("gpt_tokenizer.mjs", "r", encoding="utf-8").read()
-                self.tokenizer = execjs.compile(js_code)
+                self.tokenizer = JSGPTTokenizer(js_filename="gpt_tokenizer.mjs",use_mp=True)
             except Exception as e:
                 print(f"Frror occurred when loading JavaScript GPT-tokenizer module:{e}", file=sys.stderr)
                 print("Falling back to tiktoken (gpt-4o).", file=sys.stderr)
@@ -71,6 +70,7 @@ class Worker:
         """
         Tokenizes a chunk of text and returns its token frequencies.
         """
+        #print(f"The text chunk size is {len(text_chunk)}")
         if self.tokenizer is None:
             self._init_tokenizer()
 
@@ -81,7 +81,7 @@ class Worker:
         if "gpt" in self.tokenizer_name:
             if not isinstance(self.tokenizer, tiktoken.Encoding):
                 """Run JavaScript module for gpt-style tokenizer"""
-                tokens = self.tokenizer.call("tokenize", text_chunk)
+                tokens = self.tokenizer.encode_batch(text_chunk)
             else:
                 """load tiktoken gpt-style tokenizer(gpt-4o)"""
                 tokens = self.tokenizer.encode_batch(text_chunk)
@@ -94,6 +94,24 @@ class Worker:
         self.tokenize_times += 1
 
         return Counter(tokens)
+    
+    def close(self):
+        """
+        Explicitly closes any held resources, like the JSGPTTokenizer pool.
+        """
+        if isinstance(self.tokenizer, JSGPTTokenizer):
+            self.tokenizer.close()
+    
+    def __del__(self):
+        # You can keep __del__ as a fallback, but don't rely on it.
+        self.close()
+
+    # Optional: Make it a context manager for even safer use
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
 
 
 # --- Helper Generators ---
@@ -136,9 +154,11 @@ def read_chunks_from_file(file_path: str, chunk_size_bytes: int) -> Iterator[lis
     We concat 64kb of data into one single string, and batch these strings as lists.
     This is the best for AutoTokenizer to process.
     """
-    SINGLE_CHUNK = 64 # each str is 64kb
+    SINGLE_CHUNK = 64*1024 # each str is 64kb
     try:
         iterations = int(chunk_size_bytes/SINGLE_CHUNK)
+        print("Chunk size bytes:",chunk_size_bytes)
+        print("Iterations:",iterations)
         with open(file_path, "r", encoding="utf-8") as f:
             batch = []
             chunk = ''
@@ -146,6 +166,7 @@ def read_chunks_from_file(file_path: str, chunk_size_bytes: int) -> Iterator[lis
                 for _ in range(iterations):
                     chunk = f.read(SINGLE_CHUNK)
                     batch.append(chunk)
+                print(len(batch))
                 yield batch
                 batch = []
 
@@ -261,31 +282,33 @@ def main(args: argparse.Namespace):
             args.corpus_path, CHUNK_SIZE_BYTES
         )
         
-    worker = Worker(tokenizer_name=args.tokenizer)
-    tokenize_and_count = worker.tokenize_and_count
+    with Worker(tokenizer_name=args.tokenizer) as worker:
+        tokenize_and_count = worker.tokenize_and_count
 
-    try:
-        print("Process started. Processing chunks and aggregating results...", flush=True)
-        chunk_count = 0
-        for i, counts_from_chunk in enumerate(text_chunks_iterator):
-            total_counts.update(tokenize_and_count(counts_from_chunk))
-            chunk_count = i + 1
-            
-            # Print a progress update every 100 chunks
-            if chunk_count % 10 == 0:
-                print(
-                    f"  ... Aggregated {chunk_count} chunks. "
-                    f"Total unique tokens so far: {len(total_counts)}",
-                    flush=True
-                )
+        try:
+            print("Process started. Processing chunks and aggregating results...", flush=True)
+            chunk_count = 0
+            for i, counts_from_chunk in enumerate(text_chunks_iterator):
+                total_counts.update(tokenize_and_count(counts_from_chunk))
+                chunk_count = i + 1
+                
+                # Print a progress update every 100 chunks
+                if chunk_count % 1 == 0:
+                    print(
+                        f"  ... Aggregated {chunk_count} chunks. "
+                        f"Total unique tokens so far: {len(total_counts)}",
+                        flush=True
+                    )
 
-        print(f"\nProcessing complete. Aggregated a total of {chunk_count} chunks.")
+            print(f"\nProcessing complete. Aggregated a total of {chunk_count} chunks.")
 
-    except KeyboardInterrupt:
-        print("\nInterrupted by user. Stopping...", file=sys.stderr)
-        print("Note: Results will be partial.", file=sys.stderr)
-    except Exception as e:
-        print(f"\nAn error occurred: {e}", file=sys.stderr)
+        except KeyboardInterrupt:
+            print("\nInterrupted by user. Stopping...", file=sys.stderr)
+            print("Note: Results will be partial.", file=sys.stderr)
+            Worker.close()
+        except Exception as e:
+            print(f"\nAn error occurred: {e}", file=sys.stderr)
+            Worker.close()
     
     # --- Save Results ---
     if not total_counts:
