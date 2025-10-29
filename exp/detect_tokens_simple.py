@@ -11,15 +11,15 @@ and aggregates the results into a single JSON file.
 Example Usage:
 
 # 1. From a local file (e.g., a 1GB text file)
-python detect_tokens_simple.py -p ../test/corpus.txt -c 512 Qwen/Qwen2.5-7B
-python detect_tokens_simple.py -p ../test/corpus.txt -c 512 gpt5
+python detect_tokens_simple.py -p ../test/corpus.txt -c 2048 Qwen/Qwen2.5-7B
+python detect_tokens_simple.py -p ../test/corpus.txt -c 1024 gpt5
 
 # 2. From a Hugging Face streaming dataset
 python3 detect_tokens_2.py "Geralt-Targaryen/C4-zh" \
     --dataset_mode \
     --output_file c4_zh_counts.json \
     --text_column "text" \
-    --hf_batch_size 100
+    --hf_batch_size 1024
 
 """
 import os
@@ -32,6 +32,7 @@ import sys
 from collections import Counter
 from typing import Iterator, Dict, Any
 import tiktoken
+import time
 
 from transformers import AutoTokenizer
 from datasets import Dataset, load_dataset, ReadInstruction
@@ -42,7 +43,6 @@ except:
     from utils import get_total_lines
 
 # --- Worker Function ---
-# This is the core logic that runs on each parallel process.
 class Worker:
     def __init__(self, tokenizer_name: str):
         self.tokenizer_name = tokenizer_name
@@ -63,10 +63,11 @@ class Worker:
                 except KeyError:
                     print("Warning: model not found. Using cl100k_base encoding.")
                     encoding = tiktoken.get_encoding("cl100k_base")
+                self.tokenizer = encoding
         else:
             self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name, trust_remote_code=True, use_fast=True)
         
-    def tokenize_and_count(self, text_chunk: str) -> Counter:
+    def tokenize_and_count(self, text_chunk:list[str]) -> Counter:
         """
         Tokenizes a chunk of text and returns its token frequencies.
         """
@@ -75,22 +76,21 @@ class Worker:
 
         assert self.tokenizer is not None, "Tokenizer should be initialized."
 
+        assert isinstance(text_chunk[0],str), "Flattened text chunk should be list[str]."
+
         if "gpt" in self.tokenizer_name:
             if not isinstance(self.tokenizer, tiktoken.Encoding):
                 """Run JavaScript module for gpt-style tokenizer"""
                 tokens = self.tokenizer.call("tokenize", text_chunk)
             else:
                 """load tiktoken gpt-style tokenizer(gpt-4o)"""
-                tokens = self.tokenizer.encode(text_chunk)
+                tokens = self.tokenizer.encode_batch(text_chunk)
         else:
             tokens = self.tokenizer(text_chunk)['input_ids']
 
         if isinstance(tokens[0], list):
             # Flatten list of lists
-            flat_tokens = []
-            for sublist in tokens:
-                flat_tokens.extend(sublist)
-            tokens = flat_tokens
+            tokens = flatten_list(tokens)
         self.tokenize_times += 1
 
         return Counter(tokens)
@@ -98,6 +98,9 @@ class Worker:
 
 # --- Helper Generators ---
 # These functions stream chunks of text.
+
+def flatten_list(lst:list) -> list:
+    return [item for sublist in lst for item in sublist]
 
 def read_chunks_from_jsonl(file_path: str, chunk_size: int) -> Iterator[list[str]]:
     count = 0
@@ -126,18 +129,28 @@ def read_chunks_from_jsonl(file_path: str, chunk_size: int) -> Iterator[list[str
             return_str = []
         return 
 
-def read_chunks_from_file(file_path: str, chunk_size_bytes: int) -> Iterator[str]:
+def read_chunks_from_file(file_path: str, chunk_size_bytes: int) -> Iterator[list[str]]:
     """
     Reads a local file in binary chunks and yields them as decoded strings.
     This avoids reading the entire file into memory.
+    We concat 64kb of data into one single string, and batch these strings as lists.
+    This is the best for AutoTokenizer to process.
     """
+    SINGLE_CHUNK = 64 # each str is 64kb
     try:
+        iterations = int(chunk_size_bytes/SINGLE_CHUNK)
         with open(file_path, "r", encoding="utf-8") as f:
+            batch = []
+            chunk = ''
             while True:
-                chunk = f.read(chunk_size_bytes)
+                for _ in range(iterations):
+                    chunk = f.read(SINGLE_CHUNK)
+                    batch.append(chunk)
+                yield batch
+                batch = []
+
                 if not chunk:
                     break
-                yield chunk
     except FileNotFoundError:
         print(f"Error: File not found at {file_path}", file=sys.stderr)
         sys.exit(1)
@@ -145,20 +158,27 @@ def read_chunks_from_file(file_path: str, chunk_size_bytes: int) -> Iterator[str
         print(f"Error reading file {file_path}: {e}", file=sys.stderr)
         sys.exit(1)
 
-
-def batch_hf_dataset(
-    dataset: Dataset, text_column: str, batch_size: int
-) -> Iterator[str]:
+def batch_hf_dataset(dataset: Dataset, text_column: str, batch_size: int) -> Iterator[list[str]]:
     """
     Iterates a streaming HF dataset, batches documents,
     and yields a single concatenated text chunk.
+    We concat 64kb of data into one single string, and batch these strings as lists.
+    This is the best for AutoTokenizer to process.
     """
+    SINGLE_CHUNK = 64*1024 #each strlen is 64kb
     batch_texts = []
+    str_text = []
+    str_size = 0
     for i, item in enumerate(dataset):
         try:
             text = item[text_column]
             if text:  # Ensure text is not None or empty
-                batch_texts.append(text)
+                str_text.append(text)
+                str_size += sys.getsizeof(text)
+                if str_size>SINGLE_CHUNK:
+                    batch_texts.append(' '.join(str_text))
+                    str_text = []
+                    str_size = 0
         except KeyError:
             print(
                 f"Error: Text column '{text_column}' not found in dataset.",
@@ -171,12 +191,12 @@ def batch_hf_dataset(
             continue # Skip this item
 
         if len(batch_texts) >= batch_size:
-            yield " ".join(batch_texts)
+            yield batch_texts
             batch_texts = []
 
     # Yield any remaining items in the last batch
     if batch_texts:
-        yield " ".join(batch_texts)
+        yield batch_texts
 
 
 # --- Main Logic ---
@@ -252,7 +272,7 @@ def main(args: argparse.Namespace):
             chunk_count = i + 1
             
             # Print a progress update every 100 chunks
-            if chunk_count % 100 == 0:
+            if chunk_count % 10 == 0:
                 print(
                     f"  ... Aggregated {chunk_count} chunks. "
                     f"Total unique tokens so far: {len(total_counts)}",
@@ -318,8 +338,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "-c", "--chunk_size_kb",
         type=int,
-        default=64,
-        help="Size of each text chunk (in skbytes) to read from a local file. Default: 64"
+        default=4096,
+        help="Size of each text chunk (in kbytes) to read from a local file. Default: 64"
     )
 
     parser.add_argument(
