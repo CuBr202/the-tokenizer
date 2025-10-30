@@ -202,6 +202,7 @@ def batch_hf_dataset(dataset: Dataset, text_column: str, batch_size: int) -> Ite
     batch_texts = []
     str_text = []
     str_size = 0
+    lth = 0
     for i, item in enumerate(dataset):
         try:
             text = item[text_column]
@@ -224,9 +225,13 @@ def batch_hf_dataset(dataset: Dataset, text_column: str, batch_size: int) -> Ite
             continue # Skip this item
 
         if len(batch_texts) >= batch_size:
+            lth += 1
+            if lth == 1:
+                print("The first one length is:",len(batch_texts[0]),flush=True)
             yield batch_texts
             batch_texts = []
 
+    print("Total dataset items:",lth,flush=True)
     # Yield any remaining items in the last batch
     if batch_texts:
         yield batch_texts
