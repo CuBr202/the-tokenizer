@@ -26,7 +26,7 @@ def _init_worker(js_filename: str):
         
         # Compile the JS code and store it in the worker's global variable
         worker_tokenizer = execjs.compile(js_code)
-        print(f"Worker process {os.getpid()} initialized tokenizer.")
+        #print(f"Worker process {os.getpid()} initialized tokenizer.")
     except Exception as e:
         # Handle errors during worker initialization
         print(f"Worker process {os.getpid()} FAILED to initialize: {e}")

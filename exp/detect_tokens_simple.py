@@ -19,7 +19,7 @@ python3 detect_tokens_2.py "Geralt-Targaryen/C4-zh" \
     --dataset_mode \
     --output_file c4_zh_counts.json \
     --text_column "text" \
-    --hf_batch_size 1024
+    --chunk_size 1024
 
 """
 import os
@@ -191,7 +191,7 @@ def read_chunks_from_file(file_path: str, chunk_size_bytes: int) -> Iterator[lis
         print(f"Error reading file {file_path}: {e}", file=sys.stderr)
         sys.exit(1)
 
-def batch_hf_dataset(dataset: Dataset, text_column: str, batch_size: int) -> Iterator[list[str]]:
+def batch_hf_dataset(dataset: Dataset, text_column: str, chunk_size_bytes: int) -> Iterator[list[str]]:
     """
     Iterates a streaming HF dataset, batches documents,
     and yields a single concatenated text chunk.
@@ -200,40 +200,55 @@ def batch_hf_dataset(dataset: Dataset, text_column: str, batch_size: int) -> Ite
     """
     SINGLE_CHUNK = 64*1024 #each strlen is 64kb
     batch_texts = []
-    str_text = []
-    str_size = 0
-    lth = 0
-    for i, item in enumerate(dataset):
-        try:
-            text = item[text_column]
-            if text:  # Ensure text is not None or empty
-                str_text.append(text)
-                str_size += sys.getsizeof(text)
-                if str_size>SINGLE_CHUNK:
-                    batch_texts.append(' '.join(str_text))
-                    str_text = []
-                    str_size = 0
-        except KeyError:
-            print(
-                f"Error: Text column '{text_column}' not found in dataset.",
-                file=sys.stderr
-            )
-            print(f"Available columns: {list(item.keys())}", file=sys.stderr)
-            sys.exit(1)
-        except TypeError:
-            print(f"Error: Item {i} is not a dictionary? Item: {item}", file=sys.stderr)
-            continue # Skip this item
+    str_text_parts = []
+    current_chunk_len = 0
+    batch_count = int(chunk_size_bytes/SINGLE_CHUNK)
 
-        if len(batch_texts) >= batch_size:
-            lth += 1
-            if lth == 1:
-                print("The first one length is:",len(batch_texts[0]),flush=True)
-            yield batch_texts
-            batch_texts = []
+    #print(f"Starting dataset batching. Single string length: {SINGLE_CHUNK} chars.")
 
-    print("Total dataset items:",lth,flush=True)
-    # Yield any remaining items in the last batch
+    try:
+        # Use dataset.iter() for efficient batch-based I/O
+        for item_batch in dataset.iter(batch_size=chunk_size_bytes/1024*8):
+            texts = item_batch[text_column]
+            
+            for text in texts:
+                if text: # Ensure text is not None or empty
+                    str_text_parts.append(text)
+                    current_chunk_len += len(text) # Use len() (char length) - it's fast
+                    
+                    # When a chunk is full, join it and add to batch
+                    if current_chunk_len >= SINGLE_CHUNK:
+                        batch_texts.append(' '.join(str_text_parts))
+                        str_text_parts = []
+                        current_chunk_len = 0
+                        
+                        # When a batch is full, yield it
+                        if len(batch_texts) >= batch_count:
+                            yield batch_texts
+                            batch_texts = []
+
+    except KeyError:
+        print(
+            f"Error: Text column '{text_column}' not found in dataset.",
+            file=sys.stderr
+        )
+        # We can't know the keys without the first item, 
+        # but this error will stop the process.
+        sys.exit(1)
+    except TypeError as e:
+        print(f"Error: Data structure mismatch? {e}", file=sys.stderr)
+        # Continue to next batch
+        pass
+
+    # --- Handle Leftovers ---
+    
+    # 1. Add the last partial chunk (if any)
+    if str_text_parts:
+        batch_texts.append(' '.join(str_text_parts))
+
+    # 2. Yield the last partial batch (if any)
     if batch_texts:
+        #print(f"Yielding final partial batch of size {len(batch_texts)}")
         yield batch_texts
 
 
@@ -282,7 +297,7 @@ def main(args: argparse.Namespace):
         try:
             dataset = load_dataset(args.corpus_path, split="train", streaming=True)
             text_chunks_iterator = batch_hf_dataset(
-                dataset, args.text_column, args.hf_batch_size
+                dataset, args.text_column, CHUNK_SIZE_BYTES
             )
         except Exception as e:
             print(f"Error loading dataset '{args.corpus_path}': {e}", file=sys.stderr)
@@ -310,7 +325,7 @@ def main(args: argparse.Namespace):
                 chunk_count = i + 1
                 
                 # Print a progress update every 100 chunks
-                if chunk_count % 1 == 0:
+                if chunk_count % 10 == 0:
                     print(
                         f"  ... Aggregated {chunk_count} chunks. "
                         f"Total unique tokens so far: {len(total_counts)}",
@@ -384,12 +399,6 @@ if __name__ == "__main__":
         type=str,
         default="text",
         help="The name of the column in the HF dataset that contains the text. Default: 'text'"
-    )
-    parser.add_argument(
-        "-b","--hf_batch_size",
-        type=int,
-        default=1000,
-        help="Number of documents to batch together from the HF dataset to form one 'chunk'. Default: 1000"
     )
 
     # --- Parse args and run ---
