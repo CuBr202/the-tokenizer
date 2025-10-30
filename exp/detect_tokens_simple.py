@@ -208,7 +208,7 @@ def batch_hf_dataset(dataset: Dataset, text_column: str, chunk_size_bytes: int) 
 
     try:
         # Use dataset.iter() for efficient batch-based I/O
-        for item_batch in dataset.iter(batch_size=chunk_size_bytes/1024*8):
+        for item_batch in dataset.iter(batch_size=int(chunk_size_bytes/1024*8)):
             texts = item_batch[text_column]
             
             for text in texts:
