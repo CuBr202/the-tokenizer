@@ -1,5 +1,6 @@
 import json
 import os
+os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
 from transformers import AutoTokenizer
 from typing import List, Iterable
